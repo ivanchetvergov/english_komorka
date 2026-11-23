@@ -1,8 +1,11 @@
+import {audioPlayer,previewHomework} from './student.js';
+
 const assignmentsPath = '/api/admin/assignments';
 const questionTypes = {
   choice: 'Один вариант',
   multi: 'Несколько вариантов',
   text: 'Текстовый ответ',
+  speaking: 'Speaking · устный ответ',
   hangman: 'Угадай слово',
   match: 'Сопоставление',
   flash: 'Карточки',
@@ -43,8 +46,7 @@ function row(...children) {
 }
 
 function actions(...children) {
-  const node = element('div');
-  Object.assign(node.style, { display: 'flex', flexWrap: 'wrap', gap: '0.5rem' });
+  const node = element('div', undefined, 'button-row');
   node.append(...children);
   return node;
 }
@@ -141,6 +143,7 @@ function validateDocument(document) {
         requireValue(question.solution.trim(), `${path}.solution`, 'укажите слово для угадывания');
       }
       list(question.options, `${path}.options`, string);
+      if (question.acceptedAnswers!==undefined) list(question.acceptedAnswers, `${path}.acceptedAnswers`, string);
       list(question.pairs, `${path}.pairs`, (pair, pairPath) => {
         object(pair, pairPath);
         face(pair.left, `${pairPath}.left`);
@@ -265,7 +268,16 @@ function renderMatching(question, answer) {
   return list;
 }
 
-function renderAnswers(submission) {
+function renderReviewAnswer(question,answer) {
+  if(question.type==='match') return renderMatching(question,answer);
+  if(question.type==='speaking' && typeof answer==='string'
+    && (answer.startsWith('data:audio/')||answer.startsWith('/media/'))) {
+    return audioPlayer(answer);
+  }
+  return element('p',answerText(answer),'answer-review-text');
+}
+
+function renderAnswers(submission, buildMark) {
   const result = element('div');
   const answers = Array.isArray(submission.answers) ? submission.answers : [];
   const sections = Array.isArray(submission.document?.sections) ? submission.document.sections : [];
@@ -275,13 +287,16 @@ function renderAnswers(submission) {
     if (section.title) result.append(element('h4', section.title));
     for (const question of section.questions) {
       const answer = answers[index++];
-      result.append(element('p', `${index}. ${question?.prompt || 'Задание'}`));
+      const item=element('section',undefined,'question exercise-review');
+      item.append(element('h4', `${index}. ${question.prompt || 'Задание'}`));
       if (Array.isArray(question?.media)) {
         for (const media of question.media) {
-          if (media && Object.hasOwn(mediaKinds, media.kind)) result.append(mediaPreview(media.kind, media.url));
+          if (media && Object.hasOwn(mediaKinds, media.kind)) item.append(mediaPreview(media.kind, media.url));
         }
       }
-      result.append(question?.type === 'match' ? renderMatching(question, answer) : element('p', answerText(answer)));
+      item.append(renderReviewAnswer(question,answer));
+      if (buildMark) item.append(buildMark(index-1));
+      result.append(item);
     }
   }
   for (; index < answers.length; index++) {
@@ -336,11 +351,15 @@ export async function admin(root, api) {
 
   function login() {
     const page = panel('Вход в учительскую');
+    page.classList.add('admin-login');
+    page.append(element('p', 'Здесь можно создавать задания и проверять ответы.', 'help-text'));
     const form = element('form');
     const password = element('input');
     password.type = 'password';
     password.autocomplete = 'current-password';
     password.required = true;
+    password.placeholder = 'Введите пароль';
+    form.className = 'student-entry';
     form.append(field('Пароль', password), button('Войти', null, 'primary'));
     form.addEventListener('submit', event => {
       event.preventDefault();
@@ -361,7 +380,7 @@ export async function admin(root, api) {
   function dashboard() {
     const page = panel('Учительская');
     const newAssignment = button('Новая работа', () => openEditor(), 'primary');
-    const reload = button('Обновить список', () => run(refresh));
+    const reload = button('Обновить список', () => run(refresh), 'secondary button-quiet');
     const logout = button('Выйти', () => {
       if (!canLeaveEditor()) return;
       void run(async () => {
@@ -385,18 +404,28 @@ export async function admin(root, api) {
 
   function renderAssignments() {
     assignmentList.replaceChildren();
-    if (!assignments.length) assignmentList.append(element('p', 'Работ пока нет.'));
+    if (!assignments.length) assignmentList.append(element('p', 'Работ пока нет. Нажмите «Новая работа», чтобы создать первую.', 'notice'));
     for (const assignment of assignments) {
       const item = element('div', undefined, 'assignment');
-      item.style.flexWrap = 'wrap';
       const summary = element('div');
-      summary.append(
-        element('strong', assignment.document.title || 'Без названия'),
-        element('small', `${assignment.code} · ${statuses[assignment.status] ?? assignment.status}`),
-      );
+      const badge = element('span', statuses[assignment.status] ?? assignment.status, 'assignment-status');
+      badge.dataset.status = assignment.status;
+      summary.append(element('strong', assignment.document.title || 'Без названия'),
+        element('small', assignment.code), ' ', badge);
       const controls = actions(
         button('Редактировать', () => openEditor(assignment)),
         button('Сдачи', () => run(() => openReview(assignment))),
+        button('Посмотреть как ученик', () => showPreview(assignment.document)),
+        button('Дублировать', () => run(async () => {
+          if (!canLeaveEditor()) return;
+          const document=structuredClone(assignment.document);
+          document.title=('Копия · '+document.title).slice(0,140);
+          const {code}=await api(assignmentsPath,{method:'POST',body:{document}});
+          editing=null;
+          await refresh();
+          openEditor({code,status:'draft',document});
+          announce('Создан новый черновик.');
+        })),
       );
       if (assignment.status === 'published') {
         controls.append(button('Скопировать ссылку', () => run(() => copyLink(assignment.code))));
@@ -404,6 +433,21 @@ export async function admin(root, api) {
       item.append(summary, controls);
       assignmentList.append(item);
     }
+  }
+
+  function showPreview(document) {
+    const dialog=element('dialog',undefined,'preview-dialog');
+    const body=element('section',undefined,'panel');
+    const close=button('Закрыть предпросмотр',()=>dialog.close());
+    dialog.append(close,body);
+    dialog.addEventListener('close',()=>{
+      for (const control of body.querySelectorAll('.speaking-control')) control.dispatchEvent(new Event('previewclose'));
+      dialog.remove();
+    },{once:true});
+    previewHomework(body,document);
+    root.append(dialog);
+    dialog.showModal();
+    close.focus();
   }
 
   async function copyLink(code) {
@@ -492,6 +536,7 @@ export async function admin(root, api) {
           state.dirty = true;
         }, 'textarea');
         const textarea = json.querySelector('textarea');
+        textarea.classList.add('json-editor');
         textarea.rows = 18;
         textarea.spellcheck = false;
         body.replaceChildren(json);
@@ -507,7 +552,13 @@ export async function admin(root, api) {
 
     function renderFooter() {
       status.textContent = statuses[state.status];
-      const controls = [button('Сохранить', () => run(() => save()), 'primary')];
+      status.classList.add('assignment-status');
+      status.dataset.status = state.status;
+      const controls = [button('Сохранить', () => run(() => save()), 'primary'),
+        button('Посмотреть как ученик', () => {
+          try { showPreview(state.mode==='json'?parseDocument(state.json):validateDocument(state.document)); }
+          catch (error) { announce(error.message,true); }
+        })];
       if (state.status !== 'published') {
         controls.push(button('Опубликовать', () => run(() => save('published'))));
       } else {
@@ -574,20 +625,18 @@ export async function admin(root, api) {
     }
 
     function collection(title, items, noun, create, render) {
-      const group = element('fieldset');
+      const group = element('fieldset', undefined, 'editor-group');
       const list = element('div');
-      group.style.minWidth = '0';
-      group.style.marginBlock = '0.85rem';
       function addItem(item, index) {
-        const entry = element('div');
+        const entry = element('div', undefined, 'editor-entry');
         const remove = button('Удалить', () => {
           items.splice(index, 1);
           state.dirty = true;
           redraw();
         });
+        remove.classList.add('button-remove');
         remove.setAttribute('aria-label', `Удалить ${noun} №${index + 1}`);
         entry.append(...render(item, index), remove);
-        entry.style.marginBottom = '0.85rem';
         list.append(entry);
         return entry;
       }
@@ -617,6 +666,18 @@ export async function admin(root, api) {
       const specific = element('div');
       function renderSpecific() {
         specific.replaceChildren();
+        if (['choice','multi','text'].includes(question.type)) {
+          const key=inputField('Ключ автопроверки', (question.acceptedAnswers??[]).join('\n'), value => {
+            question.acceptedAnswers=value.split('\n').map(line=>line.trim()).filter(Boolean);
+            state.dirty=true;
+          },'textarea');
+          const hint = question.type==='text' ? 'Один допустимый ответ на строку. Пусто — ручная проверка.'
+            : question.type==='multi' ? 'Перечислите все правильные варианты, по одному на строку. Пусто — ручная проверка.'
+            : 'Введите точный текст правильного варианта. Пусто — ручная проверка.';
+          key.append(element('p',hint,'help-text'));
+          specific.append(key);
+        }
+        if (question.type==='speaking') specific.append(element('p','Ученик сможет записать до 60 секунд, прослушать ответ и перезаписать его.','help-text'));
         switch (question.type) {
           case 'choice':
           case 'multi':
@@ -662,6 +723,7 @@ export async function admin(root, api) {
             if (next && Object.hasOwn(saved, next)) question[next] = saved[next];
             inactiveFields.set(question, saved);
           }
+          if (question.type!==type) delete question.acceptedAnswers;
           question.type = type;
           state.dirty = true;
           renderSpecific();
@@ -745,7 +807,7 @@ export async function admin(root, api) {
   }
 
   function submissionCard(submission) {
-    const card = element('article');
+    const card = element('article', undefined, 'submission-card');
     const date = new Date(submission.createdAt);
     card.append(element('h3', submission.name || 'Без имени'));
     if (submission.createdAt && Number.isFinite(date.getTime())) {
@@ -754,37 +816,68 @@ export async function admin(root, api) {
       card.append(time);
     }
     const details = element('details');
-    details.append(element('summary', 'Ответы ученика'), renderAnswers(submission));
-    const form = element('form');
-    const scoreField = inputField('Баллы', submission.score, null, 'number');
-    const maxField = inputField('Максимум баллов', submission.maxScore, null, 'number');
-    const feedbackField = inputField('Комментарий', submission.feedback, null, 'textarea');
-    const score = scoreField.querySelector('input');
-    const max = maxField.querySelector('input');
-    const feedback = feedbackField.querySelector('textarea');
-    max.max = '100000';
-    feedback.maxLength = 6000;
-    for (const control of [score, max]) {
-      control.min = '0';
-      control.step = 'any';
-      control.required = true;
+    const form=element('form');
+    const controls=[];
+    function markFields(index) {
+      const mark=submission.marks?.[index]??submission.suggestedMarks?.[index]??{};
+      const scores=row(inputField('Баллы',mark.score,null,'number'),
+        inputField('Максимум баллов',mark.maxScore??1,null,'number'));
+      const [score,max]=scores.querySelectorAll('input');
+      for(const input of [score,max]) {
+        input.min='0';
+        input.max='1000';
+        input.step='any';
+        input.required=true;
+      }
+      const comment=inputField('Комментарий к заданию',mark.feedback,null,'textarea');
+      const feedback=comment.querySelector('textarea');
+      feedback.maxLength=900;
+      const hints={
+        article:'Проверь, нужен ли здесь артикль a/an или the.',
+        tense:'Проверь, какое время подходит по контексту.',
+        spelling:'Проверь написание этого слова.',
+      };
+      const preset=selectField('Быстрая подсказка',{'':'Выберите подсказку',article:'Артикль',tense:'Время глагола',spelling:'Правописание'},'',key=>{
+        if (!hints[key]) return;
+        const next=[feedback.value,hints[key]].filter(Boolean).join('\n');
+        if (next.length<=feedback.maxLength) feedback.value=next;
+        preset.querySelector('select').value='';
+      });
+      const fields=element('div');
+      if(!submission.marks && mark.automatic) fields.append(element('p','Баллы предложены автоматически.','help-text'));
+      fields.append(scores,comment,preset);
+      controls.push({score,max,feedback});
+      return fields;
     }
-    form.append(row(scoreField, maxField), feedbackField, button('Сохранить оценку', null, 'primary'));
-    form.addEventListener('submit', event => {
+    details.append(element('summary','Ответы и баллы по заданиям'),renderAnswers(submission,markFields));
+    details.open=true;
+    const general=inputField('Общий комментарий',submission.feedback,null,'textarea');
+    const feedback=general.querySelector('textarea');
+    feedback.maxLength=6000;
+    if(submission.score!==null) card.append(element('p',`Опубликовано: ${submission.score} / ${submission.maxScore}`,'score-summary'));
+    form.append(details,general,button('Опубликовать оценку',null,'primary'));
+    form.addEventListener('submit',event=>{
       event.preventDefault();
-      void run(async () => {
-        const points = score.valueAsNumber;
-        const total = max.valueAsNumber;
-        if (!Number.isFinite(points) || !Number.isFinite(total) || points < 0 || points > total || total <= 0 || total > 100000) {
-          throw new Error('Максимум должен быть больше нуля и не больше 100 000. Баллы должны быть от нуля до указанного максимума.');
+      void run(async()=>{
+        const marks=controls.map(({score,max,feedback})=>({score:score.valueAsNumber,maxScore:max.valueAsNumber,feedback:feedback.value}));
+        if (marks.some(mark=>!Number.isFinite(mark.score)||!(mark.maxScore>0)||mark.score<0||mark.score>mark.maxScore)) {
+          throw new Error('Заполните баллы по всем заданиям. Балл должен быть от нуля до максимума.');
         }
-        await api(`/api/admin/submissions/${encodeURIComponent(submission.id)}`, {
-          method: 'PATCH', body: { score: points, maxScore: total, feedback: feedback.value },
+        await api(`/api/admin/submissions/${encodeURIComponent(submission.id)}`,{
+          method:'PATCH',body:{marks,feedback:feedback.value},
         });
-        announce(`Оценка сохранена · ${submission.name || 'Без имени'}.`);
+        const score=marks.reduce((total,mark)=>total+mark.score,0);
+        const max=marks.reduce((total,mark)=>total+mark.maxScore,0);
+        let summary=card.querySelector('.score-summary');
+        if(!summary) {
+          summary=element('p',undefined,'score-summary');
+          card.insertBefore(summary,form);
+        }
+        summary.textContent=`Опубликовано: ${score} / ${max}`;
+        announce(`Оценка опубликована · ${submission.name || 'Без имени'}.`);
       });
     });
-    card.append(details, form);
+    card.append(form);
     return card;
   }
 

@@ -4,23 +4,26 @@ import {mkdirSync,readFileSync,writeFileSync,statSync,createReadStream} from 'no
 import {resolve,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {openDatabase} from './storage/database.js';
-import {check,schema,example,validateDocument,validateAnswers} from './document.js';
+import {check,schema,example,validateDocument,validateAnswers,questions,suggestMarks,validateMarks} from './document.js';
 
 const publicDir = resolve(dirname(fileURLToPath(import.meta.url)), '../web');
 const digest = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(24).toString('base64url');
 const sessionAge = 8 * 3600;
-const mime = {png:'image/png',jpg:'image/jpeg',webp:'image/webp',gif:'image/gif',mp3:'audio/mpeg',mp4:'video/mp4'};
+const mime = {png:'image/png',jpg:'image/jpeg',webp:'image/webp',gif:'image/gif',mp3:'audio/mpeg',mp4:'video/mp4',webm:'audio/webm',ogg:'audio/ogg',wav:'audio/wav'};
 const mimeExtensions = Object.fromEntries(Object.entries(mime).map(([ext,type])=>[type,ext]));
+const audioExtensions = {webm:'webm',ogg:'ogg',mp4:'mp4',mpeg:'mp3',wav:'wav'};
 const hashOrder = (code, revision, index, slot) => digest([code,revision,index,slot].join(':'));
 function studentDocument(document,code,revision,review=false) {
   let index=0;
   return {...document,sections:document.sections.map(s=>({...s,questions:s.questions.map(q=>{
     const questionIndex=index++;
-    if(q.type!=='match') return q;
+    const visible={...q};
+    if(!review) delete visible.acceptedAnswers;
+    if(q.type!=='match') return visible;
     const order=q.pairs.map((_,i)=>i).sort((a,b)=>hashOrder(code,revision,questionIndex,a).localeCompare(hashOrder(code,revision,questionIndex,b)));
     if(order.every((i,j)=>i===j)) order.push(order.shift());
-    return {...q,pairs:review?q.pairs:[],matchLeft:q.pairs.map(p=>p.left),matchRight:order.map(i=>q.pairs[i].right)};
+    return {...visible,pairs:review?q.pairs:[],matchLeft:q.pairs.map(p=>p.left),matchRight:order.map(i=>q.pairs[i].right)};
   })}))};
 }
 async function readBody(req, limit) {
@@ -34,9 +37,9 @@ async function readBody(req, limit) {
   }
   return Buffer.concat(chunks);
 }
-async function json(req) {
+async function json(req, limit=1024*1024) {
   check(req.headers['content-type']?.split(';')[0]==='application/json','Ожидается JSON',415);
-  const bytes=await readBody(req,1024*1024);
+  const bytes=await readBody(req,limit);
   let value;
   try { value=JSON.parse(bytes.toString()); } catch { check(false,'Некорректный JSON'); }
   check(value && typeof value==='object' && !Array.isArray(value),'Ожидается объект JSON');
@@ -50,6 +53,19 @@ function validMedia(ext,b) {
   if(ext==='mp4') return b.toString('ascii',4,8)==='ftyp';
   return b.toString('ascii',0,3)==='ID3'||(b.length>2&&b[0]===255&&(b[1]&224)===224);
 }
+function persistAudioAnswers(answers, mediaDir) {
+  return answers.map(answer=>{
+    if(typeof answer!=='string') return answer;
+    const match=answer.match(/^data:audio\/(webm|ogg|mp4|mpeg|wav);base64,([A-Za-z0-9+/]+={0,2})$/);
+    if(!match) return answer;
+    const bytes=Buffer.from(match[2],'base64');
+    const ext=audioExtensions[match[1]];
+    const name=digest(bytes)+'.'+ext;
+    try { writeFileSync(resolve(mediaDir,name),bytes,{flag:'wx'}); }
+    catch(error) { if(error.code!=='EEXIST') throw error; }
+    return '/media/'+name;
+  });
+}
 export function createApp({dataDir=process.env.DATA_DIR||'./data',password=process.env.ADMIN_PASSWORD,secure=process.env.COOKIE_SECURE!=='0'}={}) {
   if(typeof password!=='string'||password.length<12) throw new Error('Set ADMIN_PASSWORD to at least 12 characters.');
   const mediaDir=resolve(dataDir,'media');
@@ -58,19 +74,27 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
   const sql=(query,...params)=>db.prepare(query).run(...params);
   const one=(query,...params)=>db.prepare(query).get(...params);
   const all=(query,...params)=>db.prepare(query).all(...params);
+  for(const row of all("SELECT id,answers FROM submissions WHERE answers LIKE '%data:audio/%'")) {
+    const answers=JSON.parse(row.answers);
+    const stored=persistAudioAnswers(answers,mediaDir);
+    if(JSON.stringify(stored)!==row.answers) sql('UPDATE submissions SET answers=? WHERE id=?',JSON.stringify(stored),row.id);
+  }
   const now=()=>new Date().toISOString();
   const passwordHash=Buffer.from(digest(password),'hex');
   const cookie=(res,value,age)=>res.setHeader('Set-Cookie',`lina_session=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${secure?'; Secure':''}`);
   let loginWindow=0, failureCount=0;
   function submission(row) {
     const {id,name,score,max_score:maxScore,feedback,created_at:createdAt}=row;
-    return {id,name,score,maxScore,feedback,createdAt,document:JSON.parse(row.document),answers:JSON.parse(row.answers)};
+    const document=JSON.parse(row.document);
+    const answers=JSON.parse(row.answers);
+    const marks=row.marks?JSON.parse(row.marks):null;
+    return {id,name,score,maxScore,feedback,createdAt,document,answers,marks,suggestedMarks:suggestMarks(document,answers)};
   }
   const server=createServer(async (req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff');
     res.setHeader('Referrer-Policy','no-referrer');
     res.setHeader('X-Frame-Options','DENY');
-    res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' https: data:; media-src 'self' https:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+    res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' https: data:; media-src 'self' https: data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
     const send=(status,data)=>{
       res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
       res.end(JSON.stringify(data));
@@ -153,7 +177,7 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
           return send(200,{code,revision:a.revision,document:studentDocument(JSON.parse(a.document),code,a.revision)});
         }
         if(!teacher&&submissions&&method==='POST') {
-          const {name,answers,attemptId,revision}=await json(req);
+          const {name,answers,attemptId,revision}=await json(req,10*1024*1024);
           check(typeof name==='string'&&name.trim().length>=2&&name.trim().length<=100,'Введи имя (2–100 символов)');
           check(typeof attemptId==='string'&&/^[a-zA-Z0-9_-]{24,128}$/.test(attemptId),'Неверный идентификатор попытки');
           const previous=one('SELECT token FROM submissions WHERE code=? AND attempt=?',code,attemptId);
@@ -163,11 +187,12 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
           check(a.revision===revision,'Работа изменилась. Открой её заново.',409);
           const document=JSON.parse(a.document);
           validateAnswers(document,answers);
+          const storedAnswers=persistAudioAnswers(answers,mediaDir);
           const resultToken=token();
           db.exec('BEGIN IMMEDIATE');
           try {
             const user=sql("INSERT INTO users(role,name) VALUES('student',?)",name.trim()).lastInsertRowid;
-            sql('INSERT INTO submissions(code,user_id,attempt,token,document,answers,created_at) VALUES(?,?,?,?,?,?,?)',code,user,attemptId,resultToken,JSON.stringify(studentDocument(document,code,revision,true)),JSON.stringify(answers),now());
+            sql('INSERT INTO submissions(code,user_id,attempt,token,document,answers,created_at) VALUES(?,?,?,?,?,?,?)',code,user,attemptId,resultToken,JSON.stringify(studentDocument(document,code,revision,true)),JSON.stringify(storedAnswers),now());
             db.exec('COMMIT');
           } catch(error) { db.exec('ROLLBACK'); throw error; }
           return send(201,{token:resultToken});
@@ -175,21 +200,33 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
       }
       const grade=path.match(/^\/api\/admin\/submissions\/(\d+)$/);
       if(grade&&method==='PATCH') {
-        const {score,maxScore,feedback}=await json(req);
+        let {score,maxScore,feedback,marks}=await json(req);
+        const row=one('SELECT document FROM submissions WHERE id=?',grade[1]);
+        check(row,'Ответ не найден',404);
+        if(marks!==undefined) {
+          marks=validateMarks(JSON.parse(row.document),marks);
+          score=marks.reduce((total,mark)=>total+mark.score,0);
+          maxScore=marks.reduce((total,mark)=>total+mark.maxScore,0);
+        }
         check(Number.isFinite(score)&&Number.isFinite(maxScore)&&score>=0&&maxScore>0&&maxScore<=100000&&score<=maxScore,'Проверь баллы');
         check(typeof feedback==='string'&&feedback.length<=6000,'Комментарий до 6000 символов');
-        check(sql('UPDATE submissions SET score=?,max_score=?,feedback=? WHERE id=?',score,maxScore,feedback,grade[1]).changes,'Ответ не найден',404);
+        check(sql('UPDATE submissions SET score=?,max_score=?,feedback=?,marks=? WHERE id=?',score,maxScore,feedback,marks===undefined?null:JSON.stringify(marks),grade[1]).changes,'Ответ не найден',404);
         return send(200,{ok:true});
       }
       const result=path.match(/^\/api\/results\/([\w-]{32})$/);
       if(result&&method==='GET') {
         const row=one('SELECT submissions.*,name FROM submissions JOIN users ON users.id=user_id WHERE token=?',result[1]);
         check(row,'Результат не найден',404);
-        return send(200,{title:JSON.parse(row.document).title,name:row.name,score:row.score,maxScore:row.max_score,feedback:row.feedback,createdAt:row.created_at});
+        const document=JSON.parse(row.document);
+        const answers=JSON.parse(row.answers);
+        const marks=row.marks?JSON.parse(row.marks):[];
+        const exercises=questions(document).map((q,i)=>({prompt:q.prompt,type:q.type,answer:answers[i],mark:marks[i]??null,
+          ...(q.type==='match'?{matchLeft:q.matchLeft,matchRight:q.matchRight}:{})}));
+        return send(200,{title:document.title,name:row.name,score:row.score,maxScore:row.max_score,feedback:row.feedback,createdAt:row.created_at,exercises});
       }
       if(method==='GET'&&path==='/homework.schema.json') return send(200,schema);
       if(method==='GET'&&path==='/homework.example.json') return send(200,example);
-      const media=path.match(/^\/media\/([a-f0-9]{64}\.(png|jpg|webp|gif|mp3|mp4))$/);
+      const media=path.match(/^\/media\/([a-f0-9]{64}\.(png|jpg|webp|gif|mp3|mp4|webm|ogg|wav))$/);
       if(media&&(method==='GET'||method==='HEAD')) {
         const file=resolve(mediaDir,media[1]);
         const stats=statSync(file,{throwIfNoEntry:false});

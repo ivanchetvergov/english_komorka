@@ -73,6 +73,30 @@ function showNotice(message, text) {
   message.textContent = text;
 }
 
+export function audioPlayer(source) {
+  const wrap=element('div','audio-answer');
+  const player=element('audio');
+  const state=element('span','audio-state','Loading audio…');
+  player.controls=true;
+  player.preload='metadata';
+  player.src=source;
+  player.addEventListener('loadedmetadata',()=>showNotice(state,'Audio ready · press play'));
+  player.addEventListener('waiting',()=>showNotice(state,'Loading audio…'));
+  player.addEventListener('playing',()=>showNotice(state,'Playing'));
+  player.addEventListener('pause',()=>{if(player.currentTime>0&&!player.ended)showNotice(state,'Paused')});
+  player.addEventListener('ended',()=>showNotice(state,'Finished'));
+  player.addEventListener('error',()=>showNotice(state,'Audio could not be played. Try downloading it or opening it in another browser.'));
+  wrap.append(player,state);
+  if(source.startsWith('/media/')) {
+    const download=element('a','audio-download','Download recording');
+    download.href=source;
+    download.download='voice-answer'+(source.match(/\.(webm|ogg|mp3|mp4|wav)$/)?.[0]??'.audio');
+    wrap.append(download);
+  }
+  player.load();
+  return wrap;
+}
+
 function errorMessage(error, fallback) {
   return typeof error?.message === 'string' && error.message ? error.message : fallback;
 }
@@ -159,10 +183,15 @@ function optionsControl(question, target, number) {
     target.append(label);
     return control;
   });
-  return () => {
+  const read = () => {
     const selected = controls.filter(control => control.checked).map(control => control.value);
     return multiple ? selected : (selected[0] ?? '');
   };
+  read.restore = value => {
+    for (const control of controls) control.checked = multiple
+      ? Array.isArray(value) && value.includes(control.value) : value === control.value;
+  };
+  return read;
 }
 
 function hangmanControl(question, target) {
@@ -240,7 +269,10 @@ function hangmanControl(question, target) {
     }
   });
   render();
-  return () => solved ? solution : '';
+  const read = () => solved ? solution : '';
+  read.snapshot = () => [...guesses];
+  read.restore = value => { if (Array.isArray(value)) value.forEach(letter => typeof letter==='string' && guess(letter)); };
+  return read;
 }
 
 function matchControl(question, target) {
@@ -249,7 +281,19 @@ function matchControl(question, target) {
   const mapping = left.map(() => null);
   if (!left.length || !right.length) {
     target.append(notice('This matching exercise is unavailable.'));
-    return () => [...mapping];
+    const read = () => [...mapping];
+  read.restore = value => {
+    if (!Array.isArray(value) || value.length !== mapping.length) return;
+    const used = new Set();
+    value.forEach((index,i) => {
+      if (Number.isInteger(index) && index >= 0 && index < right.length && !used.has(index)) {
+        mapping[i] = index;
+        used.add(index);
+      }
+    });
+    render();
+  };
+  return read;
   }
 
   const game = element('div', 'matching-game');
@@ -312,7 +356,19 @@ function matchControl(question, target) {
   }
 
   render();
-  return () => [...mapping];
+  const read = () => [...mapping];
+  read.restore = value => {
+    if (!Array.isArray(value) || value.length !== mapping.length) return;
+    const used = new Set();
+    value.forEach((index,i) => {
+      if (Number.isInteger(index) && index >= 0 && index < right.length && !used.has(index)) {
+        mapping[i] = index;
+        used.add(index);
+      }
+    });
+    render();
+  };
+  return read;
 }
 
 function flashControl(question, target) {
@@ -367,7 +423,147 @@ function flashControl(question, target) {
   previous.addEventListener('click', () => move(-1));
   next.addEventListener('click', () => move(1));
   render();
-  return () => reviewed.size ? `Reviewed ${reviewed.size}/${cards.length} cards` : '';
+  const read = () => reviewed.size ? `Reviewed ${reviewed.size}/${cards.length} cards` : '';
+  read.snapshot = () => ({ index, back, reviewed:[...reviewed] });
+  read.restore = value => {
+    if (!value || !Number.isInteger(value.index) || !cards[value.index] || !Array.isArray(value.reviewed)) return;
+    index = value.index;
+    back = value.back === true;
+    for (const cardIndex of value.reviewed) if (Number.isInteger(cardIndex) && cards[cardIndex]) reviewed.add(cardIndex);
+    render();
+  };
+  return read;
+}
+
+function speakingControl(target) {
+  const record = button('Record audio', 'primary');
+  const stop = button('Stop','secondary');
+  const audio = element('audio');
+  const status = notice();
+  const file = element('input');
+  file.type = 'file';
+  file.accept = 'audio/webm,audio/ogg,audio/mp4,audio/mpeg,audio/wav,audio/x-wav,.m4a';
+  const label = element('label','', 'Or choose an audio file');
+  label.append(file);
+  const upload = element('div','field');
+  upload.append(label);
+  const actions = element('div','button-row');
+  actions.append(record,stop);
+  const remove = button('Remove audio','secondary');
+  audio.controls = true;
+  audio.preload = 'metadata';
+  audio.addEventListener('loadedmetadata',()=>showNotice(status,'Audio ready · press play'));
+  audio.addEventListener('error',()=>showNotice(status,'The audio preview failed. Try another file or browser.'));
+  stop.disabled = true;
+  audio.hidden = remove.hidden = true;
+  const box = element('div','speaking-control');
+  box.append(actions,upload,status,audio,remove);
+  target.append(box);
+  let value = '';
+  let recorder;
+  let stream;
+  let timer;
+  let elapsed;
+  let busy = false;
+  const maxBytes = 768 * 1024;
+  function setAudio(next) {
+    value = next;
+    audio.hidden = remove.hidden = !value;
+    if (value) { audio.src = value; audio.load(); }
+    else { audio.removeAttribute('src'); audio.load(); }
+  }
+  function change() { box.dispatchEvent(new Event('draftchange',{bubbles:true})); }
+  function finish() {
+    clearTimeout(timer);
+    clearInterval(elapsed);
+    stream?.getTracks().forEach(track=>track.stop());
+    stream = undefined;
+    recorder = undefined;
+    busy = false;
+    record.disabled = file.disabled = remove.disabled = false;
+    stop.disabled = true;
+  }
+  async function accept(blob) {
+    const format = blob.type.split(';')[0].replace('audio/x-wav','audio/wav');
+    if (!blob.size || blob.size > maxBytes || !/^audio\/(webm|ogg|mp4|mpeg|wav)$/.test(format)) {
+      showNotice(status,'Choose a supported audio file under 768 KiB.');
+      return;
+    }
+    const data = await new Promise((resolve,reject)=>{
+      const reader = new FileReader();
+      reader.onload=()=>resolve(reader.result);
+      reader.onerror=()=>reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
+    setAudio(`data:${format};base64,${data.split(',')[1]}`);
+    record.textContent = 'Record again';
+    showNotice(status,'Audio ready. Listen before submitting.');
+    change();
+  }
+  remove.addEventListener('click',()=>{
+    setAudio('');
+    record.textContent='Record audio';
+    showNotice(status,'Audio removed.');
+    change();
+  });
+  file.addEventListener('change',async ()=>{
+    const blob=file.files[0];
+    file.value='';
+    if (!blob || busy) return;
+    busy=true;
+    record.disabled=file.disabled=remove.disabled=true;
+    try { await accept(blob); } catch { showNotice(status,'Could not read the audio file.'); }
+    finally { finish(); }
+  });
+  record.addEventListener('click',async ()=>{
+    if (busy) return;
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      showNotice(status,'Recording is unavailable. Choose an audio file instead.');
+      return;
+    }
+    const mimeType=['audio/mp4','audio/webm;codecs=opus','audio/ogg;codecs=opus'].find(type=>MediaRecorder.isTypeSupported(type));
+    if (!mimeType) { showNotice(status,'Recording is unavailable. Choose an audio file instead.');return; }
+    busy=true;
+    record.disabled=file.disabled=remove.disabled=true;
+    showNotice(status,'Waiting for microphone access…');
+    try {
+      stream=await navigator.mediaDevices.getUserMedia({audio:true});
+      if (!box.isConnected) { finish(); return; }
+      recorder=new MediaRecorder(stream,{mimeType,audioBitsPerSecond:48000});
+      const recording=recorder;
+      const chunks=[];
+      const started=Date.now();
+      recorder.addEventListener('dataavailable',event=>{ if(event.data.size)chunks.push(event.data); });
+      recorder.addEventListener('stop',async ()=>{
+        clearInterval(elapsed);
+        clearTimeout(timer);
+        stream?.getTracks().forEach(track=>track.stop());
+        try { if (box.isConnected) await accept(new Blob(chunks,{type:recording.mimeType})); }
+        catch { showNotice(status,'Could not prepare the recording.'); }
+        finally { finish(); }
+      },{once:true});
+      recorder.addEventListener('error',()=>{ showNotice(status,'Could not record. Try again or choose a file.'); finish(); },{once:true});
+      recorder.start();
+      stop.disabled=false;
+      showNotice(status,'Recording · 0 / 60 s');
+      elapsed=setInterval(()=>showNotice(status,`Recording · ${Math.min(60,Math.floor((Date.now()-started)/1000))} / 60 s`),500);
+      timer=setTimeout(()=>{if(recorder?.state==='recording')recorder.stop();},60000);
+    } catch {
+      showNotice(status,'Microphone unavailable. You can choose an audio file instead.');
+      finish();
+    }
+  });
+  stop.addEventListener('click',()=>{if(recorder?.state==='recording')recorder.stop();});
+  box.addEventListener('previewclose',()=>{if(recorder?.state==='recording')recorder.stop();finish();});
+  const read=()=>value;
+  read.busy=()=>busy;
+  read.restore=next=>{
+    if (typeof next==='string' && /^data:audio\/(webm|ogg|mp4|mpeg|wav);base64,/.test(next) && next.length<=1024*1024+64) {
+      setAudio(next);
+      record.textContent='Record again';
+    }
+  };
+  return read;
 }
 
 function renderQuestion(question, target, number) {
@@ -396,12 +592,17 @@ function renderQuestion(question, target, number) {
       return matchControl(question, block);
     case 'flash':
       return flashControl(question, block);
+    case 'speaking':
+      return speakingControl(block);
     case 'text': {
       const input = element('textarea', 'answer');
       input.rows = 2;
       input.setAttribute('aria-labelledby', heading.id);
       block.append(input);
-      return () => input.value;
+      input.maxLength = 6000;
+      const read = () => input.value;
+      read.restore = value => { if (typeof value==='string') input.value = value.slice(0,6000); };
+      return read;
     }
     default:
       block.append(notice('This question type is unavailable.'));
@@ -410,15 +611,20 @@ function renderQuestion(question, target, number) {
 }
 
 function renderCodeEntry(panel) {
-  const form = element('form');
+  const form = element('form', 'student-entry');
   const { wrapper, input } = field('Homework code');
   input.autocapitalize = 'characters';
   input.autocomplete = 'off';
   input.spellcheck = false;
+  input.placeholder = 'HW-XXXXXXXX';
+  input.setAttribute('aria-describedby', 'homework-code-hint');
+  const hint = element('p', 'field-hint', 'Use the code Lina sent you.');
+  hint.id = 'homework-code-hint';
+  wrapper.append(hint);
   const submit = button('Open homework', 'primary');
   submit.type = 'submit';
   form.append(wrapper, submit);
-  panel.append(element('h2', '', 'Student homework'), form, link('Home', '/'));
+  panel.append(element('h2', '', 'Open your homework'), form);
   input.addEventListener('input', () => input.setCustomValidity(''));
   form.addEventListener('submit', event => {
     event.preventDefault();
@@ -438,20 +644,19 @@ function renderCodeEntry(panel) {
       item.append(resultLink(title || 'Homework result', token, ''));
       list.append(item);
     }
-    panel.append(element('h3', '', 'Recent results on this device'), list);
+    const results = element('section', 'recent-results');
+    results.append(element('h3', '', 'Recent results on this device'), list);
+    panel.append(results);
   }
 }
 
-function renderHomework(panel, api, routeCode, homework) {
+function renderHomework(panel, api, routeCode, homework, preview = false) {
   const { code = routeCode, document: assignment, revision } = homework;
   const form = element('form');
-  const fields = element('fieldset');
-  fields.style.border = '0';
-  fields.style.padding = '0';
-  fields.style.margin = '0';
-  fields.style.minWidth = '0';
+  const fields = element('fieldset', 'student-fields');
   const { wrapper, input } = field('Your name');
   input.autocomplete = 'name';
+  input.placeholder = 'First and last name';
   fields.append(wrapper);
   const readAnswers = [];
   for (const section of assignment.sections ?? []) {
@@ -465,10 +670,12 @@ function renderHomework(panel, api, routeCode, homework) {
   const message = notice();
   const submit = button('Submit homework', 'primary');
   submit.type = 'submit';
-  fields.append(submit);
+  if (!preview) fields.append(submit);
   form.append(fields, message);
-  panel.replaceChildren(link('Back to code entry', '/student'), element('div', 'eyebrow', code),
-    element('h2', '', assignment.title));
+  panel.replaceChildren();
+  if (!preview) panel.append(link('Back to code entry', '/student'));
+  panel.append(element('h2', '', assignment.title));
+  if (code) panel.prepend(element('div', 'eyebrow', code));
   if (assignment.description) {
     const description = element('p');
     appendFormatted(description, assignment.description);
@@ -476,11 +683,44 @@ function renderHomework(panel, api, routeCode, homework) {
   }
   panel.append(form);
 
+  if (preview) {
+    form.addEventListener('submit', event => event.preventDefault());
+    return;
+  }
   let attemptId;
+  const draftKey = `student.draft.v1/${code}`;
+  const draftStatus = notice();
+  form.prepend(draftStatus);
+  try {
+    const draft = JSON.parse(localStorage.getItem(draftKey) ?? 'null');
+    if (draft?.revision === revision && Array.isArray(draft.answers) && draft.answers.length === readAnswers.length) {
+      input.value = typeof draft.name === 'string' ? draft.name : '';
+      attemptId = typeof draft.attemptId === 'string' ? draft.attemptId : undefined;
+      readAnswers.forEach((read,i) => read.restore?.(draft.answers[i]));
+      showNotice(draftStatus, 'Черновик восстановлен.');
+    } else if (draft) showNotice(draftStatus, 'Задание изменилось. Начни новую попытку.');
+  } catch {}
+  function saveDraft() {
+    try {
+      localStorage.setItem(draftKey, JSON.stringify({revision,name:input.value,attemptId,
+        answers:readAnswers.map(read=>read.snapshot?.()??read())}));
+    } catch {
+      showNotice(draftStatus, 'Не удалось сохранить черновик на этом устройстве.');
+      return;
+    }
+    showNotice(draftStatus, 'Черновик сохранён на этом устройстве.');
+  }
+  for (const event of ['input','click','draftchange']) form.addEventListener(event, e => {
+    if (e.type!=='click' || e.target.closest('button[type="button"]')) saveDraft();
+  });
   input.addEventListener('input', () => input.setCustomValidity(''));
   form.addEventListener('submit', async event => {
     event.preventDefault();
     if (fields.disabled) return;
+    if (readAnswers.some(read=>read.busy?.())) {
+      showNotice(message,'Stop recording and wait for the audio before submitting.');
+      return;
+    }
     const name = input.value.trim();
     if (!name) {
       input.setCustomValidity('Enter your name.');
@@ -489,6 +729,7 @@ function renderHomework(panel, api, routeCode, homework) {
     }
     attemptId ??= Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)),
       byte => byte.toString(16).padStart(2, '0')).join('');
+    saveDraft();
     const body = { name, answers: readAnswers.map(read => read()), attemptId, revision };
     fields.disabled = true;
     showNotice(message, 'Submitting homework…');
@@ -501,6 +742,7 @@ function renderHomework(panel, api, routeCode, homework) {
         throw new Error('The submission did not return a result link.');
       }
       rememberResult(assignment.title, token);
+      try { localStorage.removeItem(draftKey); } catch {}
       const receipt = element('section');
       receipt.append(notice('Homework submitted.'),
         resultLink('Open your personal result', token, 'primary'));
@@ -511,6 +753,17 @@ function renderHomework(panel, api, routeCode, homework) {
       fields.disabled = false;
     }
   });
+}
+
+export function previewHomework(target, assignment) {
+  const document = structuredClone(assignment);
+  for (const section of document.sections) for (const q of section.questions) {
+    if (q.type==='match') {
+      q.matchLeft=q.pairs.map(pair=>pair.left);
+      q.matchRight=q.pairs.map(pair=>pair.right).reverse();
+    }
+  }
+  renderHomework(target, null, null, {document}, true);
 }
 
 export async function student(root, api, code) {
@@ -578,7 +831,7 @@ export async function result(root, api, token) {
     const score = data.score == null || data.maxScore == null
       ? 'Awaiting review' : `Score: ${data.score} / ${data.maxScore}`;
     panel.replaceChildren(back, element('h2', '', data.title), element('p', '', data.name),
-      element('p', 'notice', score));
+      element('p', 'notice score-summary', score));
     if (data.createdAt != null) {
       const date = new Date(data.createdAt);
       const timestamp = element('time', '', Number.isNaN(date.getTime())
@@ -587,6 +840,38 @@ export async function result(root, api, token) {
       const submitted = element('p', '', 'Submitted ');
       submitted.append(timestamp);
       panel.append(submitted);
+    }
+    if (Array.isArray(data.exercises) && data.exercises.length) {
+      const list = element('section', 'student-section');
+      list.append(element('h3','','Your answers'));
+      data.exercises.forEach((exercise,i)=>{
+        const item=element('article','question exercise-review');
+        const title=element('h4','',`${i+1}. `);
+        appendFormatted(title,exercise.prompt);
+        item.append(title);
+        if (exercise.type==='speaking' && typeof exercise.answer==='string'
+          && (exercise.answer.startsWith('data:audio/')||exercise.answer.startsWith('/media/'))) {
+          item.append(audioPlayer(exercise.answer));
+        } else if (exercise.type==='match' && Array.isArray(exercise.answer)) {
+          const pairs=element('ul');
+          exercise.answer.forEach((index,position)=>{
+            const entry=element('li');
+            entry.append(sideContent(exercise.matchLeft?.[position],`Left item ${position+1}`),' → ',
+              index===null?'No answer':sideContent(exercise.matchRight?.[index],`Right item ${index+1}`));
+            pairs.append(entry);
+          });
+          item.append(pairs);
+        } else {
+          item.append(element('p','',Array.isArray(exercise.answer)
+            ? exercise.answer.join(', ')||'No answer' : exercise.answer||'No answer'));
+        }
+        if(exercise.mark) {
+          item.append(element('p','score-summary',`${exercise.mark.score} / ${exercise.mark.maxScore}`));
+          if(exercise.mark.feedback) item.append(feedbackContent(exercise.mark.feedback));
+        }
+        list.append(item);
+      });
+      panel.append(list);
     }
     if (data.feedback != null && data.feedback !== ''
       && (!Array.isArray(data.feedback) || data.feedback.length > 0)) {

@@ -9,6 +9,9 @@ export function openDatabase(dataDir) {
   try {
     db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
     db.exec(schema);
+    if (!db.prepare('PRAGMA table_info(submissions)').all().some(column=>column.name==='marks')) {
+      db.exec('ALTER TABLE submissions ADD COLUMN marks TEXT');
+    }
     return db;
   } catch (error) {
     db.close();
