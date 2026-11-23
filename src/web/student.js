@@ -281,19 +281,7 @@ function matchControl(question, target) {
   const mapping = left.map(() => null);
   if (!left.length || !right.length) {
     target.append(notice('This matching exercise is unavailable.'));
-    const read = () => [...mapping];
-  read.restore = value => {
-    if (!Array.isArray(value) || value.length !== mapping.length) return;
-    const used = new Set();
-    value.forEach((index,i) => {
-      if (Number.isInteger(index) && index >= 0 && index < right.length && !used.has(index)) {
-        mapping[i] = index;
-        used.add(index);
-      }
-    });
-    render();
-  };
-  return read;
+    return () => [...mapping];
   }
 
   const game = element('div', 'matching-game');
@@ -681,6 +669,15 @@ function renderHomework(panel, api, routeCode, homework, preview = false) {
     appendFormatted(description, assignment.description);
     panel.append(description);
   }
+  if (assignment.dueAt) {
+    const deadline = new Date(assignment.dueAt);
+    if (Number.isFinite(deadline.getTime())) {
+      const text = Date.now() > deadline.getTime()
+        ? `Due ${deadline.toLocaleString('en-GB')} · You may still submit; your work will be marked late.`
+        : `Due ${deadline.toLocaleString('en-GB')}`;
+      panel.append(element('p', 'notice', text));
+    }
+  }
   panel.append(form);
 
   if (preview) {
@@ -832,6 +829,7 @@ export async function result(root, api, token) {
       ? 'Awaiting review' : `Score: ${data.score} / ${data.maxScore}`;
     panel.replaceChildren(back, element('h2', '', data.title), element('p', '', data.name),
       element('p', 'notice score-summary', score));
+    if(data.late) panel.append(notice('This homework was submitted after its due date.'));
     if (data.createdAt != null) {
       const date = new Date(data.createdAt);
       const timestamp = element('time', '', Number.isNaN(date.getTime())

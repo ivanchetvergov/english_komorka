@@ -158,6 +158,9 @@ summary { cursor: pointer; }
 .admin-view .button-row { margin-block: .65rem; }
 .admin-view .panel > h3 { margin-top: 1.5rem; margin-bottom: .8rem; }
 .assignment-list { display: grid; gap: .65rem; }
+.admin-filters { gap: .6rem 1rem; margin-block: .75rem; }
+.admin-filters .field { margin: 0; }
+.submission-list { display: grid; gap: .25rem; }
 .assignment {
   min-width: 0; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
   gap: .65rem 1.2rem; padding: .85rem 1rem; background: var(--white);
@@ -216,3 +219,47 @@ summary { cursor: pointer; }
 .speaking-control audio { border-radius: 999px; }
 .exercise-review .answer-review-text { white-space: pre-wrap; }
 .exercise-review img { max-height: 7rem; vertical-align: middle; }
+
+/* Keep every teacher-facing action consistent, including download links. */
+.admin-view :is(button, .button-row a) {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  min-width: 9rem;
+  min-height: 46px;
+  padding: .55rem .9rem;
+  border: 1px solid #d48da0;
+  border-radius: var(--radius-field);
+  background: var(--pink);
+  color: #402331;
+  font: 650 .9rem/1.3 Inter, system-ui, sans-serif;
+  text-align: center;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+  transition: background .18s ease, border-color .18s ease, translate .18s ease;
+}
+.admin-view :is(button, .button-row a):hover:not(:disabled) {
+  background: #dc8fa4;
+  border-color: #c8778e;
+}
+.admin-view :is(button, .button-row a):focus-visible {
+  outline: 2px solid var(--rose);
+  outline-offset: 3px;
+}
+.admin-view :is(button, .button-row a):active:not(:disabled) { translate: 0 1px; }
+.admin-view button:disabled { cursor: default; opacity: .5; }
+.admin-view input::file-selector-button {
+  min-width: 9rem;
+  min-height: 46px;
+  padding: .55rem .9rem;
+  border: 1px solid #d48da0;
+  border-radius: 8px;
+  background: var(--pink);
+  color: #402331;
+  font: 650 .9rem/1.3 Inter, system-ui, sans-serif;
+  text-align: center;
+  cursor: pointer;
+}
+.admin-view input::file-selector-button:hover { background: #dc8fa4; }
+.admin-view .button-row > :is(button, a) { flex: 1 1 9rem; }

@@ -1,6 +1,7 @@
 import {createServer} from 'node:http';
 import {createHash,randomBytes,timingSafeEqual} from 'node:crypto';
 import {mkdirSync,readFileSync,writeFileSync,statSync,createReadStream} from 'node:fs';
+import {isIP} from 'node:net';
 import {resolve,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {openDatabase} from './storage/database.js';
@@ -53,6 +54,38 @@ function validMedia(ext,b) {
   if(ext==='mp4') return b.toString('ascii',4,8)==='ftyp';
   return b.toString('ascii',0,3)==='ID3'||(b.length>2&&b[0]===255&&(b[1]&224)===224);
 }
+function csvCell(value) {
+  let text=value==null?'':String(value);
+  if (/^[\s\uFEFF]*[=+@-]/.test(text)) text="'"+text;
+  return '"'+text.replaceAll('"','""')+'"';
+}
+function normalizedDueAt(value) {
+  if(value===undefined||value===null||value==='') return null;
+  check(typeof value==='string','Укажи корректный срок сдачи');
+  check(/(?:Z|[+-]\d{2}:\d{2})$/.test(value),'Срок сдачи должен содержать часовой пояс');
+  const date=new Date(value);
+  check(Number.isFinite(date.getTime()),'Укажи корректный срок сдачи');
+  try { return date.toISOString(); } catch { check(false,'Укажи корректный срок сдачи'); }
+}
+async function writeChunk(res,chunk) {
+  if(res.destroyed) return false;
+  if(!res.write(chunk)) {
+    await new Promise((resolve,reject)=>{
+      const cleanup=()=>{
+        res.off('drain',onDrain);
+        res.off('close',onClose);
+        res.off('error',onError);
+      };
+      const onDrain=()=>{cleanup();resolve();};
+      const onClose=()=>{cleanup();resolve();};
+      const onError=error=>{cleanup();reject(error);};
+      res.once('drain',onDrain);
+      res.once('close',onClose);
+      res.once('error',onError);
+    });
+  }
+  return !res.destroyed;
+}
 function persistAudioAnswers(answers, mediaDir) {
   return answers.map(answer=>{
     if(typeof answer!=='string') return answer;
@@ -66,7 +99,7 @@ function persistAudioAnswers(answers, mediaDir) {
     return '/media/'+name;
   });
 }
-export function createApp({dataDir=process.env.DATA_DIR||'./data',password=process.env.ADMIN_PASSWORD,secure=process.env.COOKIE_SECURE!=='0'}={}) {
+export function createApp({dataDir=process.env.DATA_DIR||'./data',password=process.env.ADMIN_PASSWORD,secure=process.env.COOKIE_SECURE!=='0',trustProxy=process.env.TRUST_PROXY==='1'}={}) {
   if(typeof password!=='string'||password.length<12) throw new Error('Set ADMIN_PASSWORD to at least 12 characters.');
   const mediaDir=resolve(dataDir,'media');
   mkdirSync(mediaDir,{recursive:true});
@@ -74,6 +107,7 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
   const sql=(query,...params)=>db.prepare(query).run(...params);
   const one=(query,...params)=>db.prepare(query).get(...params);
   const all=(query,...params)=>db.prepare(query).all(...params);
+  db.function('unicode_lower',{deterministic:true},value=>typeof value==='string'?value.toLocaleLowerCase('ru'):value);
   for(const row of all("SELECT id,answers FROM submissions WHERE answers LIKE '%data:audio/%'")) {
     const answers=JSON.parse(row.answers);
     const stored=persistAudioAnswers(answers,mediaDir);
@@ -82,13 +116,27 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
   const now=()=>new Date().toISOString();
   const passwordHash=Buffer.from(digest(password),'hex');
   const cookie=(res,value,age)=>res.setHeader('Set-Cookie',`lina_session=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${secure?'; Secure':''}`);
-  let loginWindow=0, failureCount=0;
+  const loginFailures=new Map();
+  function loginBucket(req) {
+    const current=Date.now();
+    for(const [address,bucket] of loginFailures) if(current-bucket.startedAt>=60000) loginFailures.delete(address);
+    const forwarded=req.headers['x-forwarded-for'];
+    const trustedAddress=trustProxy&&typeof forwarded==='string'&&isIP(forwarded.trim())?forwarded.trim():'';
+    const address=trustedAddress||req.socket.remoteAddress||'unknown';
+    let bucket=loginFailures.get(address);
+    if(!bucket||current-bucket.startedAt>=60000) bucket={startedAt:current,count:0};
+    loginFailures.delete(address);
+    loginFailures.set(address,bucket);
+    while(loginFailures.size>10000) loginFailures.delete(loginFailures.keys().next().value);
+    check(bucket.count<12,'Слишком много попыток. Попробуй через минуту.',429);
+    return {address,bucket};
+  }
   function submission(row) {
-    const {id,name,score,max_score:maxScore,feedback,created_at:createdAt}=row;
+    const {id,name,score,max_score:maxScore,feedback,created_at:createdAt,due_at:dueAt}=row;
     const document=JSON.parse(row.document);
     const answers=JSON.parse(row.answers);
     const marks=row.marks?JSON.parse(row.marks):null;
-    return {id,name,score,maxScore,feedback,createdAt,document,answers,marks,suggestedMarks:suggestMarks(document,answers)};
+    return {id,name,score,maxScore,feedback,createdAt,dueAt,late:Boolean(dueAt&&createdAt>dueAt),document,answers,marks,suggestedMarks:suggestMarks(document,answers)};
   }
   const server=createServer(async (req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff');
@@ -100,7 +148,8 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
       res.end(JSON.stringify(data));
     };
     try {
-      const path=new URL(req.url,'http://local').pathname;
+      const requestUrl=new URL(req.url,'http://local');
+      const path=requestUrl.pathname;
       const method=req.method;
       if(method!=='GET'&&method!=='HEAD') {
         check(req.headers['sec-fetch-site']!=='cross-site','Запрос с другого сайта отклонён',403);
@@ -111,12 +160,12 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
       if(path==='/api/health'&&method==='GET') return send(200,{ok:one('SELECT 1 AS ok').ok===1});
       if(path==='/api/session'&&method==='GET') return send(200,{admin});
       if(path==='/api/login'&&method==='POST') {
-        if(Date.now()-loginWindow>60000) { loginWindow=Date.now(); failureCount=0; }
-        check(failureCount<12,'Слишком много попыток. Попробуй через минуту.',429);
+        const attempt=loginBucket(req);
         const body=await json(req);
         if(typeof body.password!=='string'||!timingSafeEqual(Buffer.from(digest(body.password),'hex'),passwordHash)) {
-          failureCount++; return send(401,{error:'Неверный пароль'});
+          attempt.bucket.count++; return send(401,{error:'Неверный пароль'});
         }
+        loginFailures.delete(attempt.address);
         if(session) sql('DELETE FROM sessions WHERE hash=?',digest(session));
         sql('DELETE FROM sessions WHERE expires<=?',Date.now());
         const value=token();
@@ -142,15 +191,86 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
         return send(201,{url:'/media/'+name});
       }
       if(path==='/api/admin/assignments') {
-        if(method==='GET') return send(200,all('SELECT * FROM assignments ORDER BY created_at DESC').map(a=>({...a,document:JSON.parse(a.document)})));
+        if(method==='GET') {
+          if(!requestUrl.searchParams.has('limit')) {
+            return send(200,all('SELECT * FROM assignments ORDER BY created_at DESC,code DESC').map(a=>({...a,document:JSON.parse(a.document)})));
+          }
+          const limit=Number(requestUrl.searchParams.get('limit'));
+          const offset=Number(requestUrl.searchParams.get('offset')??0);
+          let cursor=null;
+          const query=(requestUrl.searchParams.get('q')??'').trim();
+          const status=requestUrl.searchParams.get('status')??'all';
+          check(Number.isInteger(limit)&&limit>=1&&limit<=100,'Размер страницы должен быть от 1 до 100');
+          check(Number.isInteger(offset)&&offset>=0&&offset<=10000000,'Неверное смещение страницы');
+          check(query.length<=140,'Поисковый запрос слишком длинный');
+          check(['all','draft','published','archived'].includes(status),'Неверный статус');
+          if(requestUrl.searchParams.has('cursor')) {
+            const encoded=requestUrl.searchParams.get('cursor');
+            check(encoded.length<=200&&/^[A-Za-z0-9_-]+$/.test(encoded),'Неверный курсор страницы');
+            try { cursor=JSON.parse(Buffer.from(encoded,'base64url').toString()); }
+            catch { check(false,'Неверный курсор страницы'); }
+            check(Array.isArray(cursor)&&cursor.length===2&&typeof cursor[0]==='string'
+              &&typeof cursor[1]==='string'&&/^HW-[A-F0-9]{8}$/.test(cursor[1]),'Неверный курсор страницы');
+          }
+          const filters=[];
+          const values=[];
+          if(status!=='all') { filters.push('status=?'); values.push(status); }
+          if(query) {
+            filters.push("(instr(unicode_lower(json_extract(document,'$.title')),unicode_lower(?))>0 OR instr(upper(code),upper(?))>0)");
+            values.push(query,query);
+          }
+          const where=filters.length?' WHERE '+filters.join(' AND '):'';
+          const total=one('SELECT COUNT(*) AS total FROM assignments'+where,...values).total;
+          const pageFilters=[...filters];
+          const pageValues=[...values];
+          if(cursor) { pageFilters.push('(created_at,code)<(?,?)'); pageValues.push(cursor[0],cursor[1]); }
+          const pageWhere=pageFilters.length?' WHERE '+pageFilters.join(' AND '):'';
+          const rows=all("SELECT code,status,revision,created_at,due_at,json_extract(document,'$.title') AS title,"
+            +'(SELECT COUNT(*) FROM submissions s WHERE s.code=assignments.code) AS submission_count,'
+            +'(SELECT COUNT(*) FROM submissions s WHERE s.code=assignments.code AND s.score IS NULL) AS pending_count,'
+            +'(SELECT COUNT(*) FROM submissions s WHERE s.code=assignments.code AND s.due_at IS NOT NULL AND s.created_at>s.due_at) AS late_count '
+            +'FROM assignments'+pageWhere+' ORDER BY created_at DESC,code DESC LIMIT ? OFFSET ?',...pageValues,limit+1,offset);
+          const hasMore=rows.length>limit;
+          const items=rows.slice(0,limit);
+          const last=items.at(-1);
+          const nextCursor=hasMore?Buffer.from(JSON.stringify([last.created_at,last.code])).toString('base64url'):null;
+          return send(200,{items,total,nextOffset:hasMore?offset+items.length:null,nextCursor});
+        }
         if(method==='POST') {
-          const {document}=await json(req);
+          const {document,dueAt}=await json(req,8*1024*1024);
           validateDocument(document);
+          const due=normalizedDueAt(dueAt);
           let code;
           do { code='HW-'+randomBytes(4).toString('hex').toUpperCase(); } while(one('SELECT 1 FROM assignments WHERE code=?',code));
-          sql('INSERT INTO assignments VALUES(?,?,?,?,?)',code,'draft',1,JSON.stringify(document),now());
+          sql('INSERT INTO assignments(code,status,revision,document,created_at,due_at) VALUES(?,?,?,?,?,?)',code,'draft',1,JSON.stringify(document),now(),due);
           return send(201,{code});
         }
+      }
+      const assignmentExport=path.match(/^\/api\/admin\/assignments\/(HW-[A-F0-9]{8})\/export\.csv$/);
+      if(assignmentExport&&method==='GET') {
+        const [code]=assignmentExport.slice(1);
+        const assignment=one('SELECT document,due_at FROM assignments WHERE code=?',code);
+        check(assignment,'Работа не найдена',404);
+        const document=JSON.parse(assignment.document);
+        const title=document.title;
+        const prompts=questions(document).map(question=>({type:question.type,prompt:question.prompt}));
+        const rows=db.prepare('SELECT submissions.id,users.name,submissions.created_at,submissions.due_at,submissions.score,submissions.max_score,submissions.feedback,submissions.answers,submissions.marks FROM submissions JOIN users ON users.id=submissions.user_id WHERE submissions.code=? ORDER BY submissions.id').iterate(code);
+        const header=['assignment_code','assignment_title','submission_id','student_name','submitted_at','current_due_at','due_at_when_submitted','late','score','max_score','feedback','question_prompts_json','answers_json','marks_json'].map(csvCell).join(',');
+        res.writeHead(200,{
+          'Content-Type':'text/csv; charset=utf-8',
+          'Content-Disposition':`attachment; filename="${code}-submissions.csv"`,
+          'Cache-Control':'no-store'
+        });
+        if(!await writeChunk(res,'\uFEFF'+header+'\r\n')) return;
+        for(const row of rows) {
+          const line=[
+            code,title,row.id,row.name,row.created_at,assignment.due_at,row.due_at,
+            Boolean(row.due_at&&row.created_at>row.due_at),row.score,row.max_score,row.feedback,JSON.stringify(prompts),
+            JSON.stringify(JSON.parse(row.answers)),row.marks?JSON.stringify(JSON.parse(row.marks)):''
+          ].map(csvCell).join(',')+'\r\n';
+          if(!await writeChunk(res,line)) return;
+        }
+        return res.end();
       }
       const assignment=path.match(/^\/api\/(admin\/assignments|homework)\/(HW-[A-F0-9]{8})(\/submissions)?$/);
       if(assignment) {
@@ -159,22 +279,56 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
         const get=()=>one('SELECT * FROM assignments WHERE code=?',code);
         if(teacher&&submissions&&method==='GET') {
           check(get(),'Работа не найдена',404);
+          if(requestUrl.searchParams.has('limit')) {
+            const limit=Number(requestUrl.searchParams.get('limit'));
+            const offset=Number(requestUrl.searchParams.get('offset')??0);
+            const cursor=requestUrl.searchParams.has('cursor')?Number(requestUrl.searchParams.get('cursor')):null;
+            const query=(requestUrl.searchParams.get('q')??'').trim();
+            const status=requestUrl.searchParams.get('status')??'all';
+            check(Number.isInteger(limit)&&limit>=1&&limit<=100,'Размер страницы должен быть от 1 до 100');
+            check(Number.isInteger(offset)&&offset>=0&&offset<=10000000,'Неверное смещение страницы');
+            check(query.length<=100,'Поисковый запрос слишком длинный');
+            check(['all','pending','reviewed'].includes(status),'Неверный фильтр проверки');
+            const filters=['code=?'];
+            const values=[code];
+            if(status==='pending') filters.push('submissions.score IS NULL');
+            if(status==='reviewed') filters.push('submissions.score IS NOT NULL');
+            if(query) { filters.push('instr(unicode_lower(name),unicode_lower(?))>0'); values.push(query); }
+            const where=' WHERE '+filters.join(' AND ');
+            const total=one('SELECT COUNT(*) AS total FROM submissions JOIN users ON users.id=user_id'+where,...values).total;
+            if(cursor!==null) {
+              check(Number.isSafeInteger(cursor)&&cursor>=1,'Неверный курсор страницы');
+              filters.push('submissions.id<?'); values.push(cursor);
+            }
+            const pageWhere=' WHERE '+filters.join(' AND ');
+            const rows=all('SELECT submissions.*,name FROM submissions JOIN users ON users.id=user_id'+pageWhere+' ORDER BY submissions.id DESC LIMIT ? OFFSET ?',...values,limit+1,offset);
+            const hasMore=rows.length>limit;
+            const items=rows.slice(0,limit);
+            return send(200,{items:items.map(submission),total,nextOffset:hasMore?offset+limit:null,
+              nextCursor:hasMore?items.at(-1).id:null});
+          }
           return send(200,all('SELECT submissions.*,name FROM submissions JOIN users ON users.id=user_id WHERE code=? ORDER BY submissions.id DESC',code).map(submission));
         }
+        if(teacher&&!submissions&&method==='GET') {
+          const a=get();
+          check(a,'Работа не найдена',404);
+          return send(200,{code,status:a.status,revision:a.revision,createdAt:a.created_at,dueAt:a.due_at,document:JSON.parse(a.document)});
+        }
         if(teacher&&!submissions&&method==='PUT') {
-          const body=await json(req);
+          const body=await json(req,8*1024*1024);
           const a=get();
           check(a,'Работа не найдена',404);
           const status=body.status??a.status;
           check(['draft','published','archived'].includes(status),'Неверный статус');
           const document=body.document===undefined?a.document:JSON.stringify(validateDocument(body.document));
-          sql('UPDATE assignments SET document=?,status=?,revision=revision+? WHERE code=?',document,status,Number(document!==a.document||status!==a.status),code);
+          const dueAt=body.dueAt===undefined?a.due_at:normalizedDueAt(body.dueAt);
+          sql('UPDATE assignments SET document=?,status=?,due_at=?,revision=revision+? WHERE code=?',document,status,dueAt,Number(document!==a.document||status!==a.status),code);
           return send(200,{code,status});
         }
         if(!teacher&&!submissions&&method==='GET') {
           const a=get();
           check(a?.status==='published','Работа не найдена или закрыта',404);
-          return send(200,{code,revision:a.revision,document:studentDocument(JSON.parse(a.document),code,a.revision)});
+          return send(200,{code,revision:a.revision,dueAt:a.due_at,document:studentDocument(JSON.parse(a.document),code,a.revision)});
         }
         if(!teacher&&submissions&&method==='POST') {
           const {name,answers,attemptId,revision}=await json(req,10*1024*1024);
@@ -192,7 +346,7 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
           db.exec('BEGIN IMMEDIATE');
           try {
             const user=sql("INSERT INTO users(role,name) VALUES('student',?)",name.trim()).lastInsertRowid;
-            sql('INSERT INTO submissions(code,user_id,attempt,token,document,answers,created_at) VALUES(?,?,?,?,?,?,?)',code,user,attemptId,resultToken,JSON.stringify(studentDocument(document,code,revision,true)),JSON.stringify(storedAnswers),now());
+            sql('INSERT INTO submissions(code,user_id,attempt,token,document,answers,created_at,due_at) VALUES(?,?,?,?,?,?,?,?)',code,user,attemptId,resultToken,JSON.stringify(studentDocument(document,code,revision,true)),JSON.stringify(storedAnswers),now(),a.due_at);
             db.exec('COMMIT');
           } catch(error) { db.exec('ROLLBACK'); throw error; }
           return send(201,{token:resultToken});
@@ -222,7 +376,7 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
         const marks=row.marks?JSON.parse(row.marks):[];
         const exercises=questions(document).map((q,i)=>({prompt:q.prompt,type:q.type,answer:answers[i],mark:marks[i]??null,
           ...(q.type==='match'?{matchLeft:q.matchLeft,matchRight:q.matchRight}:{})}));
-        return send(200,{title:document.title,name:row.name,score:row.score,maxScore:row.max_score,feedback:row.feedback,createdAt:row.created_at,exercises});
+        return send(200,{title:document.title,name:row.name,score:row.score,maxScore:row.max_score,feedback:row.feedback,createdAt:row.created_at,dueAt:row.due_at,late:Boolean(row.due_at&&row.created_at>row.due_at),exercises});
       }
       if(method==='GET'&&path==='/homework.schema.json') return send(200,schema);
       if(method==='GET'&&path==='/homework.example.json') return send(200,example);

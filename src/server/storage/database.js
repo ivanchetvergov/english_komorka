@@ -12,6 +12,13 @@ export function openDatabase(dataDir) {
     if (!db.prepare('PRAGMA table_info(submissions)').all().some(column=>column.name==='marks')) {
       db.exec('ALTER TABLE submissions ADD COLUMN marks TEXT');
     }
+    if (!db.prepare('PRAGMA table_info(assignments)').all().some(column=>column.name==='due_at')) {
+      db.exec('ALTER TABLE assignments ADD COLUMN due_at TEXT');
+    }
+    if (!db.prepare('PRAGMA table_info(submissions)').all().some(column=>column.name==='due_at')) {
+      db.exec('ALTER TABLE submissions ADD COLUMN due_at TEXT');
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS submissions_due ON submissions(code,due_at,created_at) WHERE due_at IS NOT NULL');
     return db;
   } catch (error) {
     db.close();

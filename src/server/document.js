@@ -1,4 +1,5 @@
 const types = ['choice','multi','text','hangman','match','flash','speaking'];
+const maxDocumentBytes = 4 * 1024 * 1024;
 export function check(ok, message, status = 400) {
   if (!ok) throw Object.assign(new Error(message), {status});
 }
@@ -9,6 +10,7 @@ const obj = properties => ({type:'object',properties,required:Object.keys(proper
 const side = obj({kind:enumOf('text','image'),value:str(2000,true)});
 export const schema = {
   $schema:'https://json-schema.org/draft/2020-12/schema',
+  description:'Serialized homework JSON must not exceed 4 MiB.',
   title:'Lina’s Homeworks', ...obj({
     title:str(140,true),description:str(4000),
     sections:list(obj({title:str(140,true),questions:list(obj({
@@ -48,6 +50,7 @@ function mediaURL(value) {
 export const questions = doc => doc.sections.flatMap(s=>s.questions);
 export function validateDocument(doc) {
   validate(doc,schema,'Homework');
+  check(Buffer.byteLength(JSON.stringify(doc),'utf8')<=maxDocumentBytes,'Размер задания не должен превышать 4 МиБ');
   check(questions(doc).length<=100,'До 100 вопросов на работу');
   check(questions(doc).filter(q=>q.type==='speaking').length<=8,'До восьми устных заданий на работу');
   for (const q of questions(doc)) {

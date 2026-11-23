@@ -1,6 +1,8 @@
 import {audioPlayer,previewHomework} from './student.js';
 
 const assignmentsPath = '/api/admin/assignments';
+const maxDocumentBytes = 4 * 1024 * 1024;
+const maxImportBytes = 8 * 1024 * 1024;
 const questionTypes = {
   choice: 'Один вариант',
   multi: 'Несколько вариантов',
@@ -65,6 +67,13 @@ function inputField(label, value, update, type = 'text') {
   control.value = value ?? '';
   if (update) control.addEventListener('input', () => update(control.value));
   return field(label, control);
+}
+
+function localDateTime(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 }
 
 function selectField(label, values, value, update) {
@@ -162,10 +171,14 @@ function validateDocument(document) {
       });
     });
   });
+  requireValue(new TextEncoder().encode(JSON.stringify(document)).byteLength <= maxDocumentBytes,
+    '$', 'размер задания не должен превышать 4 МиБ');
   return document;
 }
 
 function parseDocument(text) {
+  requireValue(new TextEncoder().encode(text).byteLength <= maxImportBytes,
+    'JSON', 'файл не должен превышать 8 МиБ');
   let value;
   try {
     value = JSON.parse(text);
@@ -321,6 +334,7 @@ export async function admin(root, api) {
   let busy = false;
   let assignments = [];
   let editing = null;
+  let focusAfterRun = null;
 
   function announce(message, error = false) {
     notice.textContent = message;
@@ -343,7 +357,10 @@ export async function admin(root, api) {
       busy = false;
       screen.inert = false;
       screen.removeAttribute('aria-busy');
-      if (document.activeElement === document.body && screen.contains(previousFocus)) {
+      const target=focusAfterRun;
+      focusAfterRun=null;
+      if(target?.isConnected) target.focus({preventScroll:true});
+      else if (document.activeElement === document.body && screen.contains(previousFocus)) {
         previousFocus.focus({ preventScroll: true });
       }
     }
@@ -374,12 +391,24 @@ export async function admin(root, api) {
   }
 
   const assignmentList = element('div', undefined, 'assignment-list');
+  const assignmentFilters = element('div', undefined, 'row admin-filters');
+  const assignmentSearch = element('input');
+  assignmentSearch.type = 'search';
+  assignmentSearch.placeholder = 'Название или код';
+  assignmentSearch.setAttribute('aria-label', 'Найти работу по названию или коду');
+  const assignmentStatus = selectField('Статус', { all: 'Все статусы', ...statuses }, 'all', scheduleAssignmentRefresh);
+  assignmentFilters.append(field('Поиск работ', assignmentSearch), assignmentStatus);
+  assignmentSearch.addEventListener('input', scheduleAssignmentRefresh);
   const editorSlot = element('div');
   const reviewSlot = element('div');
+  let assignmentTotal = 0;
+  let assignmentNextCursor = null;
+  let assignmentRequest = 0;
+  let assignmentSearchTimer;
 
   function dashboard() {
     const page = panel('Учительская');
-    const newAssignment = button('Новая работа', () => openEditor(), 'primary');
+    const newAssignment = button('Новая работа', () => void run(() => openEditor()), 'primary');
     const reload = button('Обновить список', () => run(refresh), 'secondary button-quiet');
     const logout = button('Выйти', () => {
       if (!canLeaveEditor()) return;
@@ -393,37 +422,85 @@ export async function admin(root, api) {
         login();
       });
     });
-    page.append(actions(newAssignment, reload, logout), element('h3', 'Работы'), assignmentList);
+    page.append(actions(newAssignment, reload, logout), element('h3', 'Работы'), assignmentFilters, assignmentList);
     screen.replaceChildren(page, editorSlot, reviewSlot);
   }
 
-  async function refresh() {
-    assignments = await api(assignmentsPath, { method: 'GET' });
+  function scheduleAssignmentRefresh() {
+    clearTimeout(assignmentSearchTimer);
+    assignmentSearchTimer = setTimeout(() => {
+      void refresh().catch(error => announce(error?.message || 'Не удалось загрузить работы.', true));
+    }, 250);
+  }
+
+  async function refresh({ append = false } = {}) {
+    const request = ++assignmentRequest;
+    const params = new URLSearchParams({
+      limit: '25',
+      q: assignmentSearch.value.trim(),
+      status: assignmentStatus.querySelector('select').value,
+    });
+    if (append && assignmentNextCursor) params.set('cursor', assignmentNextCursor);
+    const page = await api(`${assignmentsPath}?${params}`, { method: 'GET' });
+    if (request !== assignmentRequest) return;
+    if (append) {
+      const existing = new Set(assignments.map(assignment => assignment.code));
+      assignments.push(...page.items.filter(assignment => !existing.has(assignment.code)));
+    } else assignments = page.items;
+    assignmentTotal = page.total;
+    assignmentNextCursor = page.nextCursor;
     renderAssignments();
   }
 
   function renderAssignments() {
     assignmentList.replaceChildren();
-    if (!assignments.length) assignmentList.append(element('p', 'Работ пока нет. Нажмите «Новая работа», чтобы создать первую.', 'notice'));
-    for (const assignment of assignments) {
+    const query = assignmentSearch.value.trim().toLocaleLowerCase('ru');
+    const status = assignmentStatus.querySelector('select').value;
+    const visible = assignments.filter(assignment => {
+      const title = assignment.title || 'Без названия';
+      return (status === 'all' || assignment.status === status)
+        && (!query || `${title} ${assignment.code}`.toLocaleLowerCase('ru').includes(query));
+    });
+    if (!assignmentTotal && !query && status === 'all') {
+      assignmentList.append(element('p', 'Работ пока нет. Нажмите «Новая работа», чтобы создать первую.', 'notice'));
+    } else if (!visible.length) {
+      assignmentList.append(element('p', 'По заданным условиям работ не найдено.', 'notice'));
+    } else {
+      assignmentList.append(element('p', `Показано ${visible.length} из ${assignmentTotal} работ.`, 'help-text'));
+    }
+    for (const assignment of visible) {
       const item = element('div', undefined, 'assignment');
       const summary = element('div');
       const badge = element('span', statuses[assignment.status] ?? assignment.status, 'assignment-status');
       badge.dataset.status = assignment.status;
-      summary.append(element('strong', assignment.document.title || 'Без названия'),
-        element('small', assignment.code), ' ', badge);
+      const submissionCount=Number(assignment.submission_count??0);
+      const pendingCount=Number(assignment.pending_count??0);
+      const lateCount=Number(assignment.late_count??0);
+      const dueDate=assignment.due_at?new Date(assignment.due_at):null;
+      const dueLabel=dueDate&&Number.isFinite(dueDate.getTime())
+        ? ` · Срок: ${dueDate.toLocaleString('ru-RU',{dateStyle:'short',timeStyle:'short'})}` : '';
+      const lateLabel=lateCount?` · с опозданием: ${lateCount}`:'';
+      const progress=submissionCount
+        ? `Сдано: ${submissionCount} · ждут проверки: ${pendingCount}${lateLabel}${dueLabel}`
+        : `Сдач пока нет${dueLabel}`;
+      summary.append(element('strong', assignment.title || 'Без названия'),
+        element('small', assignment.code), ' ', element('small', progress), ' ', badge);
       const controls = actions(
-        button('Редактировать', () => openEditor(assignment)),
+        button('Редактировать', () => void run(() => openEditor(assignment))),
         button('Сдачи', () => run(() => openReview(assignment))),
-        button('Посмотреть как ученик', () => showPreview(assignment.document)),
+        button('Посмотреть как ученик', () => void run(async () => {
+          const detail = assignment.document ? assignment : await api(`${assignmentsPath}/${encodeURIComponent(assignment.code)}`, { method: 'GET' });
+          showPreview(detail.document);
+        })),
         button('Дублировать', () => run(async () => {
           if (!canLeaveEditor()) return;
-          const document=structuredClone(assignment.document);
+          const detail = assignment.document ? assignment : await api(`${assignmentsPath}/${encodeURIComponent(assignment.code)}`, { method: 'GET' });
+          const document=structuredClone(detail.document);
           document.title=('Копия · '+document.title).slice(0,140);
           const {code}=await api(assignmentsPath,{method:'POST',body:{document}});
           editing=null;
           await refresh();
-          openEditor({code,status:'draft',document});
+          await openEditor({code,status:'draft',document});
           announce('Создан новый черновик.');
         })),
       );
@@ -432,6 +509,9 @@ export async function admin(root, api) {
       }
       item.append(summary, controls);
       assignmentList.append(item);
+    }
+    if (assignmentNextCursor !== null) {
+      assignmentList.append(button('Показать ещё работы', () => void run(() => refresh({ append: true }))));
     }
   }
 
@@ -471,14 +551,25 @@ export async function admin(root, api) {
     return !editing?.dirty || window.confirm('Закрыть редактор без сохранения изменений?');
   }
 
-  function openEditor(assignment) {
+  window.addEventListener('beforeunload', event => {
+    if (!editing?.dirty) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
+
+  async function openEditor(assignment) {
     if (assignment && editing?.code === assignment.code) return;
     if (!canLeaveEditor()) return;
+    if (assignment && !assignment.document) {
+      const detail = await api(`${assignmentsPath}/${encodeURIComponent(assignment.code)}`, { method: 'GET' });
+      assignment = { ...assignment, ...detail };
+    }
     editing = {
       code: assignment?.code,
       status: assignment?.status ?? 'draft',
       document: assignment ? structuredClone(assignment.document) : blankDocument(),
       savedDocument: assignment?.document,
+      dueAt: assignment?.dueAt ?? null,
       mode: 'manual',
       dirty: false,
     };
@@ -515,6 +606,10 @@ export async function admin(root, api) {
       const file = importFile.files[0];
       importFile.value = '';
       if (!file) return;
+      if (file.size > maxImportBytes) {
+        announce('JSON-файл не должен превышать 8 МиБ.', true);
+        return;
+      }
       void run(async () => {
         const imported = parseDocument(await file.text());
         const text = JSON.stringify(imported, null, 2);
@@ -530,6 +625,15 @@ export async function admin(root, api) {
 
     function renderBody() {
       mode.textContent = state.mode === 'manual' ? 'Редактировать JSON' : 'Открыть визуальный редактор';
+      const dueInput=element('input');
+      dueInput.type='datetime-local';
+      dueInput.value=localDateTime(state.dueAt);
+      dueInput.addEventListener('input',()=>{
+        state.dueAt=dueInput.value?new Date(dueInput.value).toISOString():null;
+        state.dirty=true;
+      });
+      const dueField=field('Срок сдачи · необязательно',dueInput);
+      dueField.append(element('p','Время указывается по часовому поясу браузера. Поздние ответы принимаются и помечаются для преподавателя.','help-text'));
       if (state.mode === 'json') {
         const json = inputField('JSON задания', state.json, value => {
           state.json = value;
@@ -539,9 +643,10 @@ export async function admin(root, api) {
         textarea.classList.add('json-editor');
         textarea.rows = 18;
         textarea.spellcheck = false;
-        body.replaceChildren(json);
+        body.replaceChildren(dueField,json);
       } else {
         body.replaceChildren(
+          dueField,
           editorInput('Название', state.document, 'title'),
           editorInput('Описание', state.document, 'description', 'textarea'),
           element('p', 'В описании и формулировках заданий можно использовать **жирный текст**, *курсив* и переносы строк.'),
@@ -575,10 +680,10 @@ export async function admin(root, api) {
       const document = archive ? null : state.mode === 'json'
         ? parseDocument(state.json)
         : validateDocument(state.document);
-      const payload = archive ? {} : { document };
+      const payload = archive ? {} : { document,dueAt:state.dueAt };
       if (statusChange) payload.status = statusChange;
       if (!state.code) {
-        const created = await api(assignmentsPath, { method: 'POST', body: { document } });
+        const created = await api(assignmentsPath, { method: 'POST', body: { document,dueAt:state.dueAt } });
         state.code = created.code;
         state.document = document;
         state.savedDocument = structuredClone(document);
@@ -610,11 +715,7 @@ export async function admin(root, api) {
     }
 
     function upsertAssignment() {
-      const index = assignments.findIndex(assignment => assignment.code === state.code);
-      const saved = { code: state.code, status: state.status, document: state.savedDocument };
-      if (index < 0) assignments.unshift(saved);
-      else assignments[index] = saved;
-      renderAssignments();
+      void refresh().catch(error => announce(error?.message || 'Работа сохранена, но список обновить не удалось.', true));
     }
 
     function editorInput(label, target, key, type) {
@@ -633,6 +734,8 @@ export async function admin(root, api) {
           items.splice(index, 1);
           state.dirty = true;
           redraw();
+          const remaining = list.querySelectorAll('button.button-remove');
+          (remaining[Math.min(index, remaining.length - 1)] ?? add).focus();
         });
         remove.classList.add('button-remove');
         remove.setAttribute('aria-label', `Удалить ${noun} №${index + 1}`);
@@ -796,17 +899,89 @@ export async function admin(root, api) {
 
   async function openReview(assignment) {
     const endpoint = `${assignmentsPath}/${encodeURIComponent(assignment.code)}/submissions`;
-    const submissions = await api(endpoint, { method: 'GET' });
-    const page = panel(`Сдачи · ${assignment.document.title || assignment.code}`);
+    const page = panel(`Сдачи · ${assignment.title || assignment.document?.title || assignment.code}`);
+    const search = element('input');
+    search.type = 'search';
+    search.placeholder = 'Имя ученика';
+    search.setAttribute('aria-label', 'Найти сдачу по имени ученика');
+    const list = element('div', undefined, 'submission-list');
+    let submissions = [];
+    let total = 0;
+    let nextCursor = null;
+    let requestId = 0;
+    let searchTimer;
+    let filter;
+    function render() {
+      list.replaceChildren();
+      list.append(element('p', `Показано ${submissions.length} из ${total} сдач.`, 'help-text'));
+      if (!submissions.length) {
+        const filtered = search.value.trim() || filter.querySelector('select').value !== 'all';
+        list.append(element('p', total || filtered ? 'По заданным условиям сдач не найдено.' : 'Сдач пока нет.', 'notice'));
+      }
+      for (const submission of submissions) list.append(submissionCard(submission, (changed, card) => {
+        const state = filter.querySelector('select').value;
+        if (state !== 'all' && (state === 'reviewed') !== (changed.score !== null)) {
+          submissions = submissions.filter(item => item.id !== changed.id);
+          total = Math.max(0, total - 1);
+          card.remove();
+          focusAfterRun=list.querySelector('.submission-card summary') ?? search;
+          if(list.firstElementChild) list.firstElementChild.textContent=`Показано ${submissions.length} из ${total} сдач.`;
+          if(!submissions.length&&!list.querySelector('.notice')) {
+            const message=nextCursor===null
+              ? (total?'По заданным условиям сдач не найдено.':'Все сдачи проверены.')
+              : 'Показанные сдачи проверены. Можно загрузить следующие.';
+            const note=element('p',message,'notice');
+            const more=[...list.querySelectorAll('button')].find(control=>control.textContent==='Показать ещё сдачи');
+            list.insertBefore(note,more??null);
+          }
+        } else {
+          const summary = card.querySelector('.score-summary');
+          if(summary) summary.textContent=`Опубликовано: ${changed.score} / ${changed.maxScore}`;
+        }
+      }));
+      if (nextCursor !== null) {
+        list.append(button('Показать ещё сдачи', () => void loadPage(true)));
+      }
+    }
+    async function loadPage(append = false) {
+      const request = ++requestId;
+      const params = new URLSearchParams({
+        limit: '10',
+        q: search.value.trim(),
+        status: filter.querySelector('select').value,
+      });
+      if (append && nextCursor !== null) params.set('cursor', String(nextCursor));
+      try {
+        const result = await api(`${endpoint}?${params}`, { method: 'GET' });
+        if (request !== requestId) return;
+        if (append) {
+          const existing = new Set(submissions.map(submission => submission.id));
+          submissions.push(...result.items.filter(submission => !existing.has(submission.id)));
+        } else submissions = result.items;
+        if (!append) total = result.total;
+        nextCursor = result.nextCursor;
+        render();
+      } catch (error) {
+        if (request === requestId) announce(error?.message || 'Не удалось загрузить сдачи.', true);
+      }
+    }
+    filter = selectField('Проверка', { all: 'Все сдачи', pending: 'Ожидают проверки', reviewed: 'Проверены' }, 'all', () => void loadPage());
+    const filters = row(field('Поиск по имени', search), filter);
+    search.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => void loadPage(), 250);
+    });
     page.append(actions(button('Обновить сдачи', () => run(() => openReview(assignment))),
-      button('Закрыть сдачи', () => reviewSlot.replaceChildren())));
-    if (!submissions.length) page.append(element('p', 'Сдач пока нет.'));
-    for (const submission of submissions) page.append(submissionCard(submission));
+      downloadLink(`/api/admin/assignments/${encodeURIComponent(assignment.code)}/export.csv`, 'Выгрузить все сдачи CSV'),
+      button('Закрыть сдачи', () => reviewSlot.replaceChildren())),
+      element('p', 'Выгрузка содержит все сдачи этой работы, независимо от поиска и фильтра.', 'help-text'), filters, list);
+    render();
     reviewSlot.replaceChildren(page);
     page.scrollIntoView({ block: 'start' });
+    await loadPage();
   }
 
-  function submissionCard(submission) {
+  function submissionCard(submission, onUpdate) {
     const card = element('article', undefined, 'submission-card');
     const date = new Date(submission.createdAt);
     card.append(element('h3', submission.name || 'Без имени'));
@@ -815,6 +990,7 @@ export async function admin(root, api) {
       time.dateTime = date.toISOString();
       card.append(time);
     }
+    if(submission.late) card.append(element('p','notice','Сдано после срока.'));
     const details = element('details');
     const form=element('form');
     const controls=[];
@@ -849,13 +1025,13 @@ export async function admin(root, api) {
       controls.push({score,max,feedback});
       return fields;
     }
-    details.append(element('summary','Ответы и баллы по заданиям'),renderAnswers(submission,markFields));
-    details.open=true;
+    details.append(element('summary','Открыть ответы и проверку'),renderAnswers(submission,markFields));
     const general=inputField('Общий комментарий',submission.feedback,null,'textarea');
     const feedback=general.querySelector('textarea');
     feedback.maxLength=6000;
     if(submission.score!==null) card.append(element('p',`Опубликовано: ${submission.score} / ${submission.maxScore}`,'score-summary'));
-    form.append(details,general,button('Опубликовать оценку',null,'primary'));
+    details.append(general,button('Опубликовать оценку',null,'primary'));
+    form.append(details);
     form.addEventListener('submit',event=>{
       event.preventDefault();
       void run(async()=>{
@@ -868,12 +1044,12 @@ export async function admin(root, api) {
         });
         const score=marks.reduce((total,mark)=>total+mark.score,0);
         const max=marks.reduce((total,mark)=>total+mark.maxScore,0);
-        let summary=card.querySelector('.score-summary');
-        if(!summary) {
-          summary=element('p',undefined,'score-summary');
-          card.insertBefore(summary,form);
-        }
-        summary.textContent=`Опубликовано: ${score} / ${max}`;
+        submission.marks=marks;
+        submission.score=score;
+        submission.maxScore=max;
+        submission.feedback=feedback.value;
+        onUpdate?.(submission,card);
+        await refresh();
         announce(`Оценка опубликована · ${submission.name || 'Без имени'}.`);
       });
     });
