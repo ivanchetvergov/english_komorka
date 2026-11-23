@@ -507,6 +507,18 @@ export async function admin(root, api) {
       if (assignment.status === 'published') {
         controls.append(button('Скопировать ссылку', () => run(() => copyLink(assignment.code))));
       }
+      controls.append(button('Удалить полностью', () => void run(async () => {
+        if (!canLeaveEditor()) return;
+        const count=Number(assignment.submission_count??0);
+        const detail=`Удалить «${assignment.title||'Без названия'}» (${assignment.code}), все ${count} сдач и связанные медиафайлы, если ими не пользуются другие работы? Это действие нельзя отменить.`;
+        if(!window.confirm(detail)) return;
+        await api(`${assignmentsPath}/${encodeURIComponent(assignment.code)}`,{method:'DELETE'});
+        if(editing?.code===assignment.code) { editing=null; editorSlot.replaceChildren(); }
+        reviewSlot.replaceChildren();
+        assignmentNextCursor=null;
+        await refresh();
+        announce('Домашка, все сдачи и неиспользуемые медиафайлы удалены.');
+      }), 'button-remove'));
       item.append(summary, controls);
       assignmentList.append(item);
     }

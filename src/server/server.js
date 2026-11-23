@@ -1,6 +1,6 @@
 import {createServer} from 'node:http';
 import {createHash,randomBytes,timingSafeEqual} from 'node:crypto';
-import {mkdirSync,readFileSync,writeFileSync,statSync,createReadStream} from 'node:fs';
+import {mkdirSync,readFileSync,writeFileSync,statSync,createReadStream,unlinkSync} from 'node:fs';
 import {isIP} from 'node:net';
 import {resolve,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -98,6 +98,9 @@ function persistAudioAnswers(answers, mediaDir) {
     catch(error) { if(error.code!=='EEXIST') throw error; }
     return '/media/'+name;
   });
+}
+function mediaNames(value) {
+  return new Set([...String(value??'').matchAll(/\/media\/([a-f0-9]{64}\.(?:png|jpg|webp|gif|mp3|mp4|webm|ogg|wav))/g)].map(match=>match[1]));
 }
 export function createApp({dataDir=process.env.DATA_DIR||'./data',password=process.env.ADMIN_PASSWORD,secure=process.env.COOKIE_SECURE!=='0',trustProxy=process.env.TRUST_PROXY==='1'}={}) {
   if(typeof password!=='string'||password.length<12) throw new Error('Set ADMIN_PASSWORD to at least 12 characters.');
@@ -277,6 +280,33 @@ export function createApp({dataDir=process.env.DATA_DIR||'./data',password=proce
         const [,scope,code,submissions]=assignment;
         const teacher=scope.startsWith('admin');
         const get=()=>one('SELECT * FROM assignments WHERE code=?',code);
+        if(teacher&&!submissions&&method==='DELETE') {
+          const current=get();
+          check(current,'Работа не найдена',404);
+          const media=new Set(mediaNames(current.document));
+          const students=all('SELECT DISTINCT user_id FROM submissions WHERE code=?',code).map(row=>row.user_id);
+          for(const row of all('SELECT document,answers FROM submissions WHERE code=?',code)) {
+            for(const name of mediaNames(row.document)) media.add(name);
+            for(const name of mediaNames(row.answers)) media.add(name);
+          }
+          db.exec('BEGIN IMMEDIATE');
+          try {
+            sql('DELETE FROM submissions WHERE code=?',code);
+            sql('DELETE FROM assignments WHERE code=?',code);
+            for(const userId of students) sql("DELETE FROM users WHERE id=? AND role='student' AND NOT EXISTS (SELECT 1 FROM submissions WHERE user_id=?)",userId,userId);
+            db.exec('COMMIT');
+          } catch(error) { db.exec('ROLLBACK'); throw error; }
+          const referenced=new Set();
+          for(const row of all('SELECT document FROM assignments')) for(const name of mediaNames(row.document)) referenced.add(name);
+          for(const row of all('SELECT document,answers FROM submissions')) {
+            for(const name of mediaNames(row.document)) referenced.add(name);
+            for(const name of mediaNames(row.answers)) referenced.add(name);
+          }
+          for(const name of media) if(!referenced.has(name)) {
+            try { unlinkSync(resolve(mediaDir,name)); } catch(error) { if(error.code!=='ENOENT') throw error; }
+          }
+          return send(200,{deleted:true,code});
+        }
         if(teacher&&submissions&&method==='GET') {
           check(get(),'Работа не найдена',404);
           if(requestUrl.searchParams.has('limit')) {
