@@ -769,17 +769,29 @@ export async function student(root, api, code) {
     renderCodeEntry(panel);
     const quotes = ['Ошибаться можно.', 'Ты справишься!', 'Шаг за шагом.', 'Каждый ответ — прогресс.', 'Пробуй, получится!'];
     const stored = 'student.quote.v1';
-    let previous;
-    try { previous = sessionStorage.getItem(stored); } catch {}
-    const choices = quotes.filter(quote => quote !== previous);
-    const quote = choices[Math.floor(Math.random() * choices.length)];
-    try { sessionStorage.setItem(stored, quote); } catch {}
+    let quote;
+    try { quote = localStorage.getItem(stored); } catch {}
+    if (!quotes.includes(quote)) quote = quotes[Math.floor(Math.random() * quotes.length)];
     const card = element('aside', 'hero-card');
     const heading = element('h2', 'student-quote', quote);
+    heading.setAttribute('aria-live', 'polite');
     card.append(heading, element('p', '', 'Читай задания в своём темпе. Практика для этого и нужна.'));
     const landing = element('section', 'hero student-landing workspace show');
     landing.append(panel, card);
     root.replaceChildren(landing);
+    let currentQuote = quote;
+    window.setInterval(() => {
+      const choices = quotes.filter(item => item !== currentQuote);
+      const nextQuote = choices[Math.floor(Math.random() * choices.length)];
+      heading.classList.add('is-changing');
+      window.setTimeout(() => {
+        if (!heading.isConnected) return;
+        currentQuote = nextQuote;
+        heading.textContent = nextQuote;
+        try { localStorage.setItem(stored, nextQuote); } catch {}
+        heading.classList.remove('is-changing');
+      }, 220);
+    }, 15000);
     return;
   }
   panel.append(link('Back to code entry', '/student'), notice('Loading homework…'));

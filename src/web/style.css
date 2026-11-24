@@ -54,9 +54,9 @@ main { width: min(100%, 1180px); min-height: 76vh; margin: auto; padding: clamp(
   background: var(--paper); box-shadow: var(--shadow); overflow-wrap: anywhere;
 }
 .hero-copy, .hero-card, .about-intro { padding: clamp(24px, 5vw, 52px); }
-.hero h1 { font-size: clamp(3rem, 7vw, 5.5rem); line-height: .92; }
+.hero h1 { font-size: clamp(2.3rem, 5vw, 3.6rem); line-height: 1.02; }
 .hero h1 em, .about-intro h1 em { color: var(--rose); }
-.hero h1 em { display: inline; font-size: .77em; }
+.hero h1 em { display: inline; font-size: 1em; }
 .hero p, .about-intro p, .card p { color: var(--muted); }
 .hero-copy p, .about-intro h1 + p { margin-top: 1rem; }
 .hero-card { position: relative; isolation: isolate; overflow: hidden; display: flex; flex-direction: column; justify-content: center; gap: 16px; background: var(--green); border-color: var(--green); color: var(--paper); }
@@ -128,7 +128,8 @@ summary { cursor: pointer; }
 .student-view { max-width: 780px; margin-inline: auto; }
 .student-landing .panel { margin: 0; }
 .student-landing .hero-card { min-height: 250px; }
-.student-landing .student-quote { max-width: 13ch; }
+.student-landing .student-quote { max-width: 13ch; transition: opacity .22s ease, translate .22s ease; }
+.student-landing .student-quote.is-changing { opacity: 0; translate: 0 4px; }
 .student-entry { margin-top: 1.35rem; }
 .student-fields { border: 0; margin: 1rem 0 0; padding: 0; min-width: 0; }
 .student-section { margin: 1.75rem 0; }
